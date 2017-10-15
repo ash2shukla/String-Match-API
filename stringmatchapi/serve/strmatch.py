@@ -6,8 +6,88 @@ from pymongo import MongoClient
 from collections import Counter
 from math import log
 from re import sub
+from urllib import urlretrieve as ur
+from xlrd import open_workbook
+from xlrd.book import Book
+from xlwt import Workbook
+from json import dumps
+from pprint import pprint
 
-dbURL = "mongodb://risky:1234@ds145892.mlab.com:45892/stringdb"
+dbURL = "mongodb://localhost:27017/"
+filebaseURL = "http://tbcs.spikeway.com/bulkfile/"
+
+def getFile(url,pid,spid,isview):
+    lst = []
+    export = Workbook()
+    export_sheet = export.add_sheet('match')
+    book = open_workbook(ur(filebaseURL+url)[0])
+    if isinstance(book,Book):
+        sheet = book.sheet_by_index(0)
+        for i in range(sheet.nrows):
+            lst.append(sheet.cell_value(i,0))
+        instance = TfidfVectorizer()
+        matrix = instance.fit_transform(lst)
+        cosine_matrix = cs(matrix,matrix)
+        k = 0
+        outer_arr = []
+        for i in range(len(cosine_matrix)):
+            fl = list(cosine_matrix[i])
+            incr = 0
+            n_lst = lst[:i]+lst[i+1:]
+            dic = {}
+            for j in fl[:i]+fl[i+1:]:
+                if j*100 > 80:
+                    dic['string']=lst[i]
+                    dic['matched_with']=n_lst[incr]
+                    dic['percent']=str(j*100)[:6]
+                    k+=1
+                    outer_arr.append(dic)
+                    print i,incr
+                incr += 1
+        if len(outer_arr) == 0:
+            retval = pushBulk(lst,pid,spid)
+            if retval == -1 :
+                return dumps({"Reponse Code":"200","Response Message":"Unsuccessful.",'Response Data':''})
+            else:
+                return dumps({'Response Code':200,'Response Message':'Success','Response Data':retval})
+        else:
+            try:
+                return dumps({'Response Code':200,'Response Message':'Success','Response Data in file':outer_arr})
+            except:
+                return dumps({'Response Code':500,'Response Message':'Unsuccessful','Response Data':[]})
+
+def pushBulk(lst,pid,spid):
+    matchstr =[]
+    for i in lst:
+            dic = {}
+            df = search_by_tfidf(pid,i,spid,db="bulkstringdb")
+            if df['Response Message'] == "Insertion Success":
+                continue
+            elif df['Response Message'] in ["Could not Insert","Project Does not exist","Sub project does not exist","Unexpected Error."]:
+                return -1
+            else:
+                dic['string']= i
+                dic['matched'] = df['Response Data']
+            matchstr.append(dic)
+    return matchstr
+
+def pushsub(pid,spid):
+    strings = MongoClient(dbURL).stringdb['projectmap']
+    try:
+        x = MongoClient(dbURL).stringdb[pid]
+        lst = []
+        for i in strings.find({pid:{'$exists':'true'}}):
+            lst.append(i[pid])
+        if spid.capitalize() not in lst:
+            x=strings.insert({pid:spid.capitalize()})
+            if(type(x).__name__ == "ObjectId"):
+                return 1
+            else:
+                return 0
+        else:
+            return 2
+    except:
+        return 0
 
 def ret_exists(pid):
     if pid in ret_collection():
@@ -17,15 +97,21 @@ def ret_exists(pid):
 
 def ret_collection():
     c_names = MongoClient(dbURL).stringdb.collection_names()
-    c_names.remove('system.indexes')
-    c_names.remove('objectlabs-system')
-    c_names.remove('objectlabs-system.admin.collections')
     return c_names
-    
-    
+
+def ret_subprojects(pid):
+    if ret_exists(pid):
+        lst = []
+        for i in MongoClient(dbURL).stringdb['projectmap'].find({pid:{'$exists':'true'}}):
+            lst.append(i[pid])
+        return lst
+    else:
+        return False
+
 def make_collection(pid):
     try:
-        strings = MongoClient(dbURL).stringdb.create_collection(pid)
+        bulkstrings = MongoClient(dbURL).bulkstringdb.create_collection(pid.capitalize())
+        strings = MongoClient(dbURL).stringdb.create_collection(pid.capitalize())
         if type(strings).__name__ == "Collection":
             return True
         else:
@@ -33,24 +119,38 @@ def make_collection(pid):
     except:
         return False
 
-def insert(pid,arg):
-    strings = MongoClient(dbURL).stringdb[pid]
-    try:
-        x=strings.insert({'string':arg})
-        if(type(x).__name__ == "ObjectId"):
-            return 1
+def insert(pid,arg,spid,db):
+    if db == "stringdb":
+        strings = MongoClient(dbURL).stringdb[pid]
+    elif db == "bulkstringdb":
+        strings = MongoClient(dbURL).bulkstringdb[pid]
+    if ret_exists(pid):
+        if spid in ret_subprojects(pid):
+            try:
+                x=strings.insert({'spid':spid,'string':arg})
+                if(type(x).__name__ == "ObjectId"):
+                    return 1
+                else:
+                    return 0
+            except:
+                return 0
         else:
-            return 0
-    except:
-        return 0
+            return 3
+    else:
+        return 2
 
-def search_by_tfidf(pid,arg):
+
+
+def search_by_tfidf(pid,arg,spid,db = "stringdb"):
     docs=[]
     docs_original=[]
     docs.append(arg)
     docs_original.append(arg)
-    strings = MongoClient(dbURL).stringdb[pid]
-    for i in strings.find({'string':{'$exists':'true'}}):
+    if db == "stringdb":
+        strings = MongoClient(dbURL).stringdb[pid]
+    elif db == "bulkstringdb":
+        strings = MongoClient(dbURL).bulkstringdb[pid]
+    for i in strings.find({'string':{'$exists':'true'},'spid':spid}):
         docs_original.append(i['string'])
         docs.append(_prettify_string(i['string'].lower()))
     instance = TfidfVectorizer()
@@ -58,7 +158,9 @@ def search_by_tfidf(pid,arg):
     cosine_matrix = cs(matrix[0:1],matrix)[0]
     retval={'Response Code':200,'Response Message':'Success','Response Data':[]}
     for i in range(1,len(cosine_matrix)):
-        if(cosine_matrix[i]*100 > 60):
+        if (len(arg)<len(docs_original[i])) and (arg in docs_original[i]):
+            retval['Response Data'].append({'stri':docs_original[i],'perc':str(100)})
+        elif(cosine_matrix[i]*100 > 60):
             retval['Response Data'].append({'stri':docs_original[i],'perc':str(cosine_matrix[i]*100)})
         else:
             pass
@@ -66,22 +168,30 @@ def search_by_tfidf(pid,arg):
         return retval
     else:
         print("Inserting...")
-        ret=insert(pid,arg)
+        ret=insert(pid,arg,spid,db)
         if ret==0:
             return {"Response Code":"501","Response Message":"Could not Insert"}
         elif ret == 1:
             return {"Response Code":"200","Response Message":"Insertion Success"}
-
-def search(pid,arg):
+        elif ret == 2:
+            return {"Response Code":"403","Response Message":"Project Does not exist"}
+        elif ret ==3 :
+            return {"Response Code":"403","Response Message":"Sub project does not exist"}
+        else:
+            return {"Response Code":"500","Response Message":"Unexpected Error."}
+def search(pid,arg,spid,db = "strigdb"):
     arg=_prettify_string(arg.lower())
-    strings =  MongoClient().stringdb[pid]
-    cursor = strings.find()
+    if db=="stringdb":
+        strings =  MongoClient().stringdb[pid]
+    elif db == "bulkstringdb":
+        strings = MOngoClient().bulkstringdb[pid]
+    cursor = strings.find({'spid':spid})
     retval=[]
     for i in cursor:
         if (_match_str(_prettify_string(i['string'].lower()),arg)>30):
              retval.append(i['string'])
     if retval==[]:
-        ret = insert(pid,arg)
+        ret = insert(pid,arg,spid,db)
         if ret==0:
             return {"Response Code":"501","Response Message":"Could not Insert"}
         elif ret == 1:
@@ -93,6 +203,8 @@ def _prettify_string(string):
 
 def _convert_to_dict(arg):
     return Counter(arg.split())
+
+
 
 def _match_str(arg1,arg2):
     '''
